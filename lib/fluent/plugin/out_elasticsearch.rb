@@ -42,6 +42,7 @@ class Fluent::ElasticsearchOutput < Fluent::BufferedOutput
   config_param :client_cert, :string, :default => nil
   config_param :client_key_pass, :string, :default => nil
   config_param :ca_file, :string, :default => nil
+  config_param :check_index_health, :bool, :default => false
 
   include Fluent::SetTagKeyMixin
   config_set_default :include_tag_key, false
@@ -189,6 +190,7 @@ class Fluent::ElasticsearchOutput < Fluent::BufferedOutput
 
   def write(chunk)
     bulk_message = []
+    indices = Set.new # Record a set of all used indices
 
     chunk.msgpack_each do |tag, time, record|
       next unless record.is_a? Hash
@@ -215,6 +217,7 @@ class Fluent::ElasticsearchOutput < Fluent::BufferedOutput
         record.merge!(@tag_key => tag)
       end
 
+      indices.add(target_index) if check_index_health # Save CPU if health check is disabled
       meta = {"_index" => target_index, "_type" => type_name}
 
       @meta_config_map ||= { 'id_key' => '_id', 'parent_key' => '_parent', 'routing_key' => '_routing' }
@@ -226,6 +229,7 @@ class Fluent::ElasticsearchOutput < Fluent::BufferedOutput
       append_record_to_messages(@write_operation, meta, record, bulk_message)
     end
 
+    check_health(indices) if check_index_health and !indices.empty?
     send(bulk_message) unless bulk_message.empty?
     bulk_message.clear
   end
@@ -244,5 +248,37 @@ class Fluent::ElasticsearchOutput < Fluent::BufferedOutput
       end
       raise ConnectionFailure, "Could not push logs to Elasticsearch after #{retries} retries. #{e.message}"
     end
+  end
+
+  def check_health(indices)
+    # Reguest index and alias health from cluster
+    indexArgs = {:h => ['index', 'health'], :format => 'json' } # Request only index name and health
+    aliasArgs = {:h => ['index', 'alias'], :format => 'json' }  # Request only index and alias names
+    responseIndex = client.cat.indices indexArgs
+    responseAliases = client.cat.aliases aliasArgs
+
+    # Create a merged array containing index and alias health
+    # Alias name will be mapped to 'index'
+    healthInfo = Array.new()
+    responseIndex.each do |index|
+      healthInfo.push(index)
+      responseAliases.each do |indexAlias|
+        if indexAlias["index"] == index['index']
+           healthInfo.push({'index' => indexAlias['alias'], 'health' => index['health']})
+        end
+      end
+    end
+
+    healthInfo.each do |index|
+      if indices.include?(index['index']) and index['health'] != 'green' then # Search for target index in health info
+        raise "Target index #{index['index']} is not green"
+      elsif indices.include?(index['index']) then
+        $log.debug "Target index #{index['index']} is #{index['health']}"
+      else
+        # Index does not yet exists
+        # No error when index isn't found as it will be created (if configured)
+      end
+    end
+
   end
 end
